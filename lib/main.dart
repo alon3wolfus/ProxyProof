@@ -300,6 +300,7 @@ class _FacultyPageState extends State<FacultyPage> {
   String? error;
   List<dynamic> students = [];
   bool busy = false;
+  bool rotatingToken = false;
   int expiresAt = 0;
   Future<void> start() async {
     setState(() => busy = true);
@@ -333,7 +334,8 @@ class _FacultyPageState extends State<FacultyPage> {
   }
 
   Future<void> _rotateToken() async {
-    if (sessionId == null) return;
+    if (sessionId == null || rotatingToken) return;
+    rotatingToken = true;
     final bytes = List<int>.generate(11, (_) => Random.secure().nextInt(256));
     final token = base64Url.encode(bytes).replaceAll('=', '');
     try {
@@ -354,6 +356,8 @@ class _FacultyPageState extends State<FacultyPage> {
         setState(() => status = 'Broadcasting · rotating code every 5 sec');
     } catch (e) {
       if (mounted) setState(() => error = 'Bluetooth broadcast failed: $e');
+    } finally {
+      rotatingToken = false;
     }
   }
 
@@ -532,7 +536,11 @@ class _FacultyPageState extends State<FacultyPage> {
                   title: Text(s['name']),
                   subtitle: Text(
                     present
-                        ? 'Checked in · ${DateTime.fromMillisecondsSinceEpoch(s['marked_at']).toLocal().toString().substring(11, 16)}'
+                        ? '${s['source'] == 'student_fallback'
+                              ? 'Student fallback'
+                              : s['source'] == 'ble'
+                              ? 'Bluetooth check-in'
+                              : 'Manually marked'} · ${DateTime.fromMillisecondsSinceEpoch(s['marked_at']).toLocal().toString().substring(11, 16)}'
                         : 'Not checked in',
                   ),
                   trailing: present
@@ -610,6 +618,7 @@ class _StudentPageState extends State<StudentPage> {
   StreamSubscription? sub;
   Timer? liveClassRefresh;
   bool scanning = false, busy = false, checked = false;
+  final checkedSessionIds = <String>{};
   String message = 'Bluetooth scan is off';
   String? checkedClass;
   List<dynamic> liveClasses = [];
@@ -653,10 +662,13 @@ class _StudentPageState extends State<StudentPage> {
       );
       await central.stopDiscovery();
       await sub?.cancel();
-      final matchedClass = liveClasses.where((session) => session['id'] == payload[0]);
+      final matchedClass = liveClasses.where(
+        (session) => session['id'] == payload[0],
+      );
       if (mounted)
         setState(() {
           checked = true;
+          checkedSessionIds.add(payload[0]);
           scanning = false;
           checkedClass = matchedClass.isEmpty
               ? 'Attendance confirmed'
@@ -671,6 +683,61 @@ class _StudentPageState extends State<StudentPage> {
         setState(() => message = e.toString().replaceFirst('Exception: ', ''));
     } finally {
       busy = false;
+    }
+  }
+
+  Future<void> forcePresent(dynamic session) async {
+    final sessionId = session['id'] as String;
+    final className = session['className'] as String;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Use fallback check-in?'),
+        content: const Text(
+          'This records you as present without confirming Bluetooth proximity. Faculty can see that it was a student fallback check-in.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Mark me present'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => busy = true);
+    try {
+      final result = await Api.instance.request(
+        'POST',
+        '/check-in/force',
+        data: {'sessionId': sessionId},
+      );
+      if (!mounted) return;
+      await central.stopDiscovery();
+      await sub?.cancel();
+      setState(() {
+        checked = true;
+        checkedSessionIds.add(sessionId);
+        scanning = false;
+        checkedClass = 'Checked in to $className';
+        message = result['source'] == 'student_fallback'
+            ? 'Present · student fallback check-in'
+            : 'You are checked in.';
+      });
+      await _loadHistory();
+      await _loadLiveClasses();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.toString().replaceFirst('Exception: ', ''))),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => busy = false);
     }
   }
 
@@ -772,7 +839,10 @@ class _StudentPageState extends State<StudentPage> {
               padding: const EdgeInsets.all(16),
               child: Row(
                 children: [
-                  const Icon(Icons.event_busy_outlined, color: Color(0xFF718099)),
+                  const Icon(
+                    Icons.event_busy_outlined,
+                    color: Color(0xFF718099),
+                  ),
                   const SizedBox(width: 12),
                   Expanded(
                     child: Text(
@@ -793,29 +863,69 @@ class _StudentPageState extends State<StudentPage> {
             );
             final remaining = endsAt.difference(DateTime.now());
             final minutes = remaining.inMinutes;
-            final seconds = remaining.inSeconds.remainder(60).toString().padLeft(2, '0');
+            final seconds = remaining.inSeconds
+                .remainder(60)
+                .toString()
+                .padLeft(2, '0');
+            final isCheckedIn = checkedSessionIds.contains(session['id']);
             return Card(
               color: Colors.white,
-              child: ListTile(
-                leading: const CircleAvatar(
-                  backgroundColor: Color(0xFFE4F8F1),
-                  child: Icon(Icons.sensors_rounded, color: mint),
-                ),
-                title: Text(
-                  session['className'] as String,
-                  style: const TextStyle(fontWeight: FontWeight.w700),
-                ),
-                subtitle: Text(
-                  '${session['room']} · ${session['facultyName']}\nBluetooth check-in runs automatically when you are nearby.',
-                ),
-                isThreeLine: true,
-                trailing: Text(
-                  remaining.isNegative ? 'Ending' : '${minutes}m ${seconds}s',
-                  style: const TextStyle(
-                    color: blue,
-                    fontWeight: FontWeight.w700,
+              child: Column(
+                children: [
+                  ListTile(
+                    leading: const CircleAvatar(
+                      backgroundColor: Color(0xFFE4F8F1),
+                      child: Icon(Icons.sensors_rounded, color: mint),
+                    ),
+                    title: Text(
+                      session['className'] as String,
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                    subtitle: Text(
+                      '${session['room']} · ${session['facultyName']}\nBluetooth check-in runs automatically when you are nearby.',
+                    ),
+                    isThreeLine: true,
+                    trailing: Text(
+                      remaining.isNegative
+                          ? 'Ending'
+                          : '${minutes}m ${seconds}s',
+                      style: const TextStyle(
+                        color: blue,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
                   ),
-                ),
+                  if (isCheckedIn)
+                    const Padding(
+                      padding: EdgeInsets.only(left: 16, right: 16, bottom: 12),
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Chip(
+                          avatar: Icon(
+                            Icons.check_circle,
+                            color: mint,
+                            size: 18,
+                          ),
+                          label: Text('PRESENT'),
+                          visualDensity: VisualDensity.compact,
+                        ),
+                      ),
+                    )
+                  else
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                      child: SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton.icon(
+                          onPressed: busy || remaining.isNegative
+                              ? null
+                              : () => forcePresent(session),
+                          icon: const Icon(Icons.how_to_reg_outlined),
+                          label: const Text('Force present (fallback)'),
+                        ),
+                      ),
+                    ),
+                ],
               ),
             );
           }),

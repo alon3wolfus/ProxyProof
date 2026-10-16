@@ -34,6 +34,10 @@ flutter build apk --release --dart-define=PROXYPROOF_API=https://api.homelabform
 
 This endpoint still uses the shared demo password and demo accounts. Keep real attendance data off this test deployment.
 
+The student screen polls the authenticated `GET /sessions/active` endpoint and displays live class names, rooms, faculty, and time remaining. BLE scanning still handles automatic attendance check-in when the student is nearby. If BLE check-in fails, the student can choose **Force present (fallback)** for an active class. This records `student_fallback` in the faculty roster and does not verify proximity; deploy the updated `backend/server.mjs` to the VPS before building/installing a client that uses this option.
+
+Device binding is temporarily disabled on the VPS (`DEVICE_BINDING_ENABLED=false`) so demo accounts can sign in on either phone. Re-enable it by setting that flag to `true` in the VPS `start.sh` and restarting the service when device approval is ready to use.
+
 ## Demo accounts
 
 The in-memory seed data contains **2 faculty accounts and 50 student accounts**. All demo emails use the `@proxyproof.demo` domain. Sign-in checks that the email exists under the selected role; because authentication is not connected yet, any non-empty password works. The quick-fill buttons use `demo` as the sample password.

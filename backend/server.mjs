@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const db = new DatabaseSync(join(dirname(fileURLToPath(import.meta.url)), 'proxyproof.sqlite'));
+const deviceBindingEnabled = process.env.DEVICE_BINDING_ENABLED === 'true';
 db.exec(`PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,name TEXT NOT NULL,role TEXT NOT NULL,password_hash TEXT NOT NULL,device_id TEXT);
 CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,faculty_id TEXT NOT NULL,class_name TEXT NOT NULL,room TEXT NOT NULL,started_at INTEGER NOT NULL,ends_at INTEGER NOT NULL,closed INTEGER NOT NULL DEFAULT 0);
@@ -42,12 +43,13 @@ const server = createServer(async (req,res) => {
       const user=db.prepare('SELECT * FROM users WHERE email=? AND role=?').get(email,b.role);
       const candidate=scryptSync(String(b.password||''),salt,32); const expected=Buffer.from(user?.password_hash||passwordHash,'hex');
       if(!user||!timingSafeEqual(candidate,expected)){json(res,401,{error:'Email, role, or password is incorrect.'});return;}
-      const device=String(b.deviceId||''); if(!device){json(res,400,{error:'Device identity is required.'});return;}
-      if(user.device_id && user.device_id!==device){
+      const device=String(b.deviceId||'');
+      if(deviceBindingEnabled && !device){json(res,400,{error:'Device identity is required.'});return;}
+      if(deviceBindingEnabled && user.device_id && user.device_id!==device){
         if(user.role==='student') db.prepare("INSERT INTO device_change_requests(id,student_id,new_device_id,created_at) SELECT ?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM device_change_requests WHERE student_id=? AND new_device_id=? AND status='pending')").run(randomBytes(8).toString('hex'),user.id,device,Date.now(),user.id,device);
         json(res,403,{error:'This account is registered to another device. A device change request has been sent to faculty.'});return;
       }
-      if(!user.device_id) db.prepare('UPDATE users SET device_id=? WHERE id=?').run(device,user.id);
+      if(deviceBindingEnabled && !user.device_id) db.prepare('UPDATE users SET device_id=? WHERE id=?').run(device,user.id);
       const token=randomBytes(32).toString('base64url'); db.prepare('INSERT INTO auth_tokens VALUES(?,?,?)').run(hash(token),user.id,Date.now()+30*24*60*60*1000);
       json(res,200,{token,user:{id:user.id,email:user.email,name:user.name,role:user.role}});return;
     }
@@ -93,11 +95,20 @@ const server = createServer(async (req,res) => {
     if(req.method==='POST'&&url.pathname==='/check-in'){
       const user=requireAuth(req,res,'student'); if(!user)return; const b=await body(req); const id=String(b.sessionId||''); const session=db.prepare('SELECT * FROM sessions WHERE id=?').get(id);
       if(!session||session.closed||session.ends_at<=Date.now()){json(res,409,{error:'This attendance session has ended.'});return;}
-      if(user.device_id!==String(b.deviceId||'')){json(res,403,{error:'This phone is not registered to this account.'});return;}
+      if(deviceBindingEnabled && user.device_id!==String(b.deviceId||'')){json(res,403,{error:'This phone is not registered to this account.'});return;}
       if(Number(b.rssi)<-78){json(res,403,{error:'Signal is too weak to confirm you are in the room.'});return;}
       const valid=db.prepare('SELECT 1 FROM tokens WHERE token_hash=? AND session_id=? AND expires_at>?').get(hash(String(b.token||'')),id,Date.now());
       if(!valid){json(res,409,{error:'The session code expired. Keep Bluetooth on while nearby.'});return;}
       db.prepare('INSERT OR IGNORE INTO attendance VALUES(?,?,?,?)').run(id,user.id,Date.now(),'ble'); json(res,200,{marked:true,markedAt:Date.now()});return;
+    }
+    if(req.method==='POST'&&url.pathname==='/check-in/force'){
+      const user=requireAuth(req,res,'student'); if(!user)return; const b=await body(req); const id=String(b.sessionId||'');
+      const session=db.prepare('SELECT * FROM sessions WHERE id=? AND closed=0 AND ends_at>?').get(id,Date.now());
+      if(!session){json(res,409,{error:'This attendance session has ended.'});return;}
+      const markedAt=Date.now();
+      db.prepare("INSERT OR IGNORE INTO attendance VALUES(?,?,?,'student_fallback')").run(id,user.id,markedAt);
+      const record=db.prepare('SELECT marked_at AS markedAt,source FROM attendance WHERE session_id=? AND student_id=?').get(id,user.id);
+      json(res,200,{marked:true,markedAt:record.markedAt,source:record.source});return;
     }
     if(req.method==='GET'&&url.pathname==='/my-attendance'){
       const user=requireAuth(req,res,'student'); if(!user)return;
@@ -136,4 +147,4 @@ const server = createServer(async (req,res) => {
     json(res,404,{error:'Route not found.'});
   } catch(error) { console.error(error); json(res,500,{error:'Server error. Check the local service log.'}); }
 });
-const port=Number(process.env.PORT||8787); const host=process.env.HOST||'127.0.0.1'; server.listen(port,host,()=>console.log(`ProxyProof local SQL service listening on http://${host}:${port} (${users.length} seeded accounts; demo password: demo)`));
+const port=Number(process.env.PORT||8787); const host=process.env.HOST||'127.0.0.1'; server.listen(port,host,()=>console.log(`ProxyProof local SQL service listening on http://${host}:${port} (${users.length} seeded accounts; demo password: demo; device binding: ${deviceBindingEnabled?'enabled':'disabled'})`));
