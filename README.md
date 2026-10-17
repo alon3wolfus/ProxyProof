@@ -22,26 +22,11 @@ Keep Bluetooth on and both apps in the foreground while validating. Android asks
 
 This is a one-way BLE broadcast followed by an authenticated HTTPS check-in. Phones do not pair or connect to each other over Bluetooth. The faculty phone broadcasts the session ID and current token; the student phone submits that data to the API, which makes the attendance decision.
 
-```mermaid
-sequenceDiagram
-    participant Faculty
-    participant API
-    participant Student
-    Faculty->>API: Create live session
-    API-->>Faculty: Session ID
-    loop Every 5 seconds
-        Faculty->>API: Register fresh token
-        API-->>Faculty: Token accepted; valid for 12 seconds
-        Faculty->>Student: BLE service data: sessionId:token
-    end
-    Student->>API: HTTPS check-in: sessionId, token, RSSI, deviceId
-    API->>API: Validate student, session, signal, token expiry
-    API-->>Student: Attendance accepted or rejection reason
-    loop Every 2 seconds
-        Faculty->>API: Refresh attendance roster
-        API-->>Faculty: Updated present list
-    end
-```
+1. **Faculty starts a session.** The API returns the session ID.
+2. **Faculty rotates the BLE token every five seconds.** The API stores its hash for 12 seconds, then the faculty phone broadcasts `sessionId:token` in BLE service data.
+3. **Student scans and submits the handshake.** The student phone sends the session ID, token, RSSI, and device ID to the API over HTTPS.
+4. **The API decides attendance.** It checks the active session, signal strength, and token expiry before creating a present mark.
+5. **Faculty sees the result.** The roster refreshes from the API every two seconds.
 
 ### Faculty: create and rotate the code
 
