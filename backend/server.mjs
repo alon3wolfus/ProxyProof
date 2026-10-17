@@ -96,19 +96,11 @@ const server = createServer(async (req,res) => {
       const user=requireAuth(req,res,'student'); if(!user)return; const b=await body(req); const id=String(b.sessionId||''); const session=db.prepare('SELECT * FROM sessions WHERE id=?').get(id);
       if(!session||session.closed||session.ends_at<=Date.now()){json(res,409,{error:'This attendance session has ended.'});return;}
       if(deviceBindingEnabled && user.device_id!==String(b.deviceId||'')){json(res,403,{error:'This phone is not registered to this account.'});return;}
-      if(Number(b.rssi)<-78){json(res,403,{error:'Signal is too weak to confirm you are in the room.'});return;}
+      const rssi=Number(b.rssi);
+      if(!Number.isFinite(rssi)||rssi>0||rssi<-78){json(res,403,{error:'Signal is invalid or too weak to confirm you are in the room.'});return;}
       const valid=db.prepare('SELECT 1 FROM tokens WHERE token_hash=? AND session_id=? AND expires_at>?').get(hash(String(b.token||'')),id,Date.now());
       if(!valid){json(res,409,{error:'The session code expired. Keep Bluetooth on while nearby.'});return;}
       db.prepare('INSERT OR IGNORE INTO attendance VALUES(?,?,?,?)').run(id,user.id,Date.now(),'ble'); json(res,200,{marked:true,markedAt:Date.now()});return;
-    }
-    if(req.method==='POST'&&url.pathname==='/check-in/force'){
-      const user=requireAuth(req,res,'student'); if(!user)return; const b=await body(req); const id=String(b.sessionId||'');
-      const session=db.prepare('SELECT * FROM sessions WHERE id=? AND closed=0 AND ends_at>?').get(id,Date.now());
-      if(!session){json(res,409,{error:'This attendance session has ended.'});return;}
-      const markedAt=Date.now();
-      db.prepare("INSERT OR IGNORE INTO attendance VALUES(?,?,?,'student_fallback')").run(id,user.id,markedAt);
-      const record=db.prepare('SELECT marked_at AS markedAt,source FROM attendance WHERE session_id=? AND student_id=?').get(id,user.id);
-      json(res,200,{marked:true,markedAt:record.markedAt,source:record.source});return;
     }
     if(req.method==='GET'&&url.pathname==='/my-attendance'){
       const user=requireAuth(req,res,'student'); if(!user)return;

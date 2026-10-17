@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -301,6 +302,9 @@ class _FacultyPageState extends State<FacultyPage> {
   List<dynamic> students = [];
   bool busy = false;
   bool rotatingToken = false;
+  bool loadingRoster = false;
+  bool broadcasting = false;
+  bool sessionClosed = false;
   int expiresAt = 0;
   Future<void> start() async {
     setState(() => busy = true);
@@ -316,25 +320,71 @@ class _FacultyPageState extends State<FacultyPage> {
       );
       sessionId = s['id'];
       sessionName = s['className'];
-      await peripheral.authorize();
-      await _rotateToken();
-      rotate = Timer.periodic(
-        const Duration(seconds: 5),
-        (_) => _rotateToken(),
-      );
+      sessionClosed = false;
       refresh = Timer.periodic(const Duration(seconds: 2), (_) => _roster());
       await _roster();
-      if (mounted) setState(() => error = null);
+      await _startBroadcast();
     } catch (e) {
-      if (mounted)
-        setState(() => error = e.toString().replaceFirst('Exception: ', ''));
+      if (mounted) {
+        setState(() {
+          if (sessionId != null) status = 'Broadcast paused';
+          error = e.toString().replaceFirst('Exception: ', '');
+        });
+      }
     } finally {
       if (mounted) setState(() => busy = false);
     }
   }
 
-  Future<void> _rotateToken() async {
-    if (sessionId == null || rotatingToken) return;
+  Future<void> _startBroadcast() async {
+    if (Platform.isAndroid) {
+      final authorized = await peripheral.authorize();
+      if (!authorized) {
+        throw Exception(
+          'Bluetooth permission was denied. Allow Nearby devices and try again.',
+        );
+      }
+    }
+    if (peripheral.state == BluetoothLowEnergyState.poweredOff) {
+      throw Exception('Turn on Bluetooth, then retry the broadcast.');
+    }
+    if (peripheral.state == BluetoothLowEnergyState.unsupported) {
+      throw Exception('This phone does not support BLE advertising.');
+    }
+    if (await _rotateToken()) {
+      rotate?.cancel();
+      rotate = Timer.periodic(
+        const Duration(seconds: 5),
+        (_) => _rotateToken(),
+      );
+    }
+  }
+
+  Future<void> retryBroadcast() async {
+    if (sessionId == null || sessionClosed || busy) return;
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      await _startBroadcast();
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          broadcasting = false;
+          status = 'Broadcast paused';
+          error = e.toString().replaceFirst('Exception: ', '');
+        });
+      }
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<bool> _rotateToken() async {
+    if (sessionId == null || sessionClosed || rotatingToken) {
+      return broadcasting;
+    }
     rotatingToken = true;
     final bytes = List<int>.generate(11, (_) => Random.secure().nextInt(256));
     final token = base64Url.encode(bytes).replaceAll('=', '');
@@ -352,33 +402,65 @@ class _FacultyPageState extends State<FacultyPage> {
           },
         ),
       );
-      if (mounted)
-        setState(() => status = 'Broadcasting · rotating code every 5 sec');
+      broadcasting = true;
+      if (mounted) {
+        setState(() {
+          status = 'Broadcasting · rotating code every 5 sec';
+          error = null;
+        });
+      }
+      return true;
     } catch (e) {
-      if (mounted) setState(() => error = 'Bluetooth broadcast failed: $e');
+      broadcasting = false;
+      rotate?.cancel();
+      try {
+        await peripheral.stopAdvertising();
+      } catch (_) {}
+      if (mounted) {
+        setState(() {
+          status = 'Broadcast paused';
+          error = 'Bluetooth broadcast failed: $e';
+        });
+      }
+      return false;
     } finally {
       rotatingToken = false;
     }
   }
 
   Future<void> _roster() async {
-    if (sessionId == null) return;
+    if (sessionId == null || loadingRoster) return;
+    loadingRoster = true;
     try {
       final r = await Api.instance.request(
         'GET',
         '/sessions/$sessionId/attendance',
       );
       if (!mounted) return;
+      final sessionEndsAt = r['session']['endsAt'] as int;
+      final sessionEnded =
+          r['session']['closed'] == true ||
+          sessionEndsAt <= DateTime.now().millisecondsSinceEpoch;
       setState(() {
         students = r['students'] as List<dynamic>;
-        expiresAt = r['session']['endsAt'] as int;
-        if (r['session']['closed'] == true ||
-            expiresAt < DateTime.now().millisecondsSinceEpoch) {
-          status = 'Session closed';
-        }
+        expiresAt = sessionEndsAt;
+        sessionClosed = sessionEnded;
+        if (sessionEnded) status = 'Session closed';
       });
+      if (sessionEnded) {
+        rotate?.cancel();
+        refresh?.cancel();
+        if (broadcasting) {
+          broadcasting = false;
+          try {
+            await peripheral.stopAdvertising();
+          } catch (_) {}
+        }
+      }
     } catch (e) {
       if (mounted) setState(() => error = e.toString());
+    } finally {
+      loadingRoster = false;
     }
   }
 
@@ -386,12 +468,26 @@ class _FacultyPageState extends State<FacultyPage> {
     if (sessionId == null) return;
     rotate?.cancel();
     refresh?.cancel();
+    broadcasting = false;
+    Object? stopError;
     try {
       await peripheral.stopAdvertising();
-      await Api.instance.request('POST', '/sessions/$sessionId/close');
-      setState(() => status = 'Session closed');
     } catch (e) {
-      setState(() => error = e.toString());
+      stopError = e;
+    }
+    try {
+      await Api.instance.request('POST', '/sessions/$sessionId/close');
+      if (mounted) {
+        setState(() {
+          status = 'Session closed';
+          sessionClosed = true;
+          error = stopError == null
+              ? null
+              : 'Bluetooth stop failed: $stopError';
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => error = e.toString());
     }
   }
 
@@ -512,6 +608,13 @@ class _FacultyPageState extends State<FacultyPage> {
               label: Text(busy ? 'Starting…' : 'Start 5 minute session'),
             )
           else ...[
+            if (!broadcasting && !sessionClosed)
+              FilledButton.icon(
+                onPressed: busy ? null : retryBroadcast,
+                icon: const Icon(Icons.bluetooth_searching),
+                label: Text(busy ? 'Retrying…' : 'Retry Bluetooth broadcast'),
+              ),
+            if (!broadcasting && !sessionClosed) const SizedBox(height: 12),
             Row(
               children: [
                 const Expanded(
@@ -536,11 +639,7 @@ class _FacultyPageState extends State<FacultyPage> {
                   title: Text(s['name']),
                   subtitle: Text(
                     present
-                        ? '${s['source'] == 'student_fallback'
-                              ? 'Student fallback'
-                              : s['source'] == 'ble'
-                              ? 'Bluetooth check-in'
-                              : 'Manually marked'} · ${DateTime.fromMillisecondsSinceEpoch(s['marked_at']).toLocal().toString().substring(11, 16)}'
+                        ? '${s['source'] == 'ble' ? 'Bluetooth check-in' : 'Manually marked'} · ${DateTime.fromMillisecondsSinceEpoch(s['marked_at']).toLocal().toString().substring(11, 16)}'
                         : 'Not checked in',
                   ),
                   trailing: present
@@ -618,10 +717,13 @@ class _StudentPageState extends State<StudentPage> {
   StreamSubscription? sub;
   Timer? liveClassRefresh;
   bool scanning = false, busy = false, checked = false;
+  bool loadingLiveClasses = false;
   final checkedSessionIds = <String>{};
+  String? scanningSessionId;
   String message = 'Bluetooth scan is off';
   String? checkedClass;
   List<dynamic> liveClasses = [];
+  String? liveClassesError;
   List<dynamic> attendance = [];
   int attendancePercent = 0;
   int completedSessions = 0;
@@ -629,15 +731,36 @@ class _StudentPageState extends State<StudentPage> {
   final seen = <String>{};
   Future<void> scan() async {
     try {
-      await central.authorize();
+      if (Platform.isAndroid) {
+        final authorized = await central.authorize();
+        if (!authorized) {
+          throw Exception(
+            'Bluetooth scan permission was denied. Allow Nearby devices and retry.',
+          );
+        }
+        if (central.state == BluetoothLowEnergyState.poweredOff) {
+          throw Exception('Turn on Bluetooth, then restart check-in.');
+        }
+        if (central.state == BluetoothLowEnergyState.unsupported) {
+          throw Exception('This phone does not support Bluetooth LE scanning.');
+        }
+      }
+      await sub?.cancel();
       sub = central.discovered.listen(_found);
       await central.startDiscovery();
-      setState(() {
-        scanning = true;
-        message = 'Scanning for an active class…';
-      });
+      if (mounted) {
+        setState(() {
+          scanning = true;
+          message = 'Scanning for an active class…';
+        });
+      }
     } catch (e) {
-      setState(() => message = 'Bluetooth permission or adapter issue: $e');
+      if (mounted) {
+        setState(() {
+          scanning = false;
+          message = 'Bluetooth permission or adapter issue: $e';
+        });
+      }
     }
   }
 
@@ -648,6 +771,10 @@ class _StudentPageState extends State<StudentPage> {
     final payload = utf8.decode(raw, allowMalformed: true).split(':');
     if (payload.length != 2 || payload[0].length != 8 || !seen.add(payload[0]))
       return;
+    if (scanningSessionId != null && payload[0] != scanningSessionId) {
+      seen.remove(payload[0]);
+      return;
+    }
     busy = true;
     try {
       await Api.instance.request(
@@ -686,55 +813,27 @@ class _StudentPageState extends State<StudentPage> {
     }
   }
 
-  Future<void> forcePresent(dynamic session) async {
+  Future<void> restartCheckIn(dynamic session) async {
     final sessionId = session['id'] as String;
-    final className = session['className'] as String;
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Use fallback check-in?'),
-        content: const Text(
-          'This records you as present without confirming Bluetooth proximity. Faculty can see that it was a student fallback check-in.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Mark me present'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
     setState(() => busy = true);
     try {
-      final result = await Api.instance.request(
-        'POST',
-        '/check-in/force',
-        data: {'sessionId': sessionId},
-      );
-      if (!mounted) return;
       await central.stopDiscovery();
       await sub?.cancel();
+      seen.clear();
+      scanningSessionId = sessionId;
       setState(() {
-        checked = true;
-        checkedSessionIds.add(sessionId);
+        checked = false;
         scanning = false;
-        checkedClass = 'Checked in to $className';
-        message = result['source'] == 'student_fallback'
-            ? 'Present · student fallback check-in'
-            : 'You are checked in.';
+        checkedClass = null;
+        message = 'Restarting Bluetooth check-in…';
       });
-      await _loadHistory();
-      await _loadLiveClasses();
+      await scan();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(e.toString().replaceFirst('Exception: ', ''))),
-        );
+        setState(() {
+          scanning = false;
+          message = 'Could not restart Bluetooth check-in: $e';
+        });
       }
     } finally {
       if (mounted) setState(() => busy = false);
@@ -754,12 +853,23 @@ class _StudentPageState extends State<StudentPage> {
   }
 
   Future<void> _loadLiveClasses() async {
+    if (loadingLiveClasses) return;
+    loadingLiveClasses = true;
     try {
       final result = await Api.instance.request('GET', '/sessions/active');
       if (!mounted) return;
-      setState(() => liveClasses = result['sessions'] as List<dynamic>);
-    } catch (_) {
-      // Keep the BLE scanner usable if the live class list cannot refresh.
+      setState(() {
+        liveClasses = result['sessions'] as List<dynamic>;
+        liveClassesError = null;
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          liveClassesError = e.toString().replaceFirst('Exception: ', '');
+        });
+      }
+    } finally {
+      loadingLiveClasses = false;
     }
   }
 
@@ -813,7 +923,7 @@ class _StudentPageState extends State<StudentPage> {
         ),
         const SizedBox(height: 10),
         const Text(
-          'Keep Bluetooth on near your classroom. Attendance is checked against the rotating live session code.',
+          'Keep Bluetooth on near your classroom. On Android 11 or earlier, turn on Location too. Attendance is checked against the rotating live session code.',
           style: TextStyle(fontSize: 15, color: Color(0xFF637089)),
         ),
         const SizedBox(height: 20),
@@ -846,7 +956,9 @@ class _StudentPageState extends State<StudentPage> {
                   const SizedBox(width: 12),
                   Expanded(
                     child: Text(
-                      scanning
+                      liveClassesError != null
+                          ? 'Could not load live classes: $liveClassesError'
+                          : scanning
                           ? 'No live classes yet. This list updates automatically.'
                           : 'No live classes found. Start scanning again to check in nearby.',
                       style: const TextStyle(color: Color(0xFF637089)),
@@ -917,11 +1029,13 @@ class _StudentPageState extends State<StudentPage> {
                       child: SizedBox(
                         width: double.infinity,
                         child: OutlinedButton.icon(
+                          icon: const Icon(Icons.how_to_reg_outlined),
+                          label: Text(
+                            busy ? 'Restarting check-in…' : 'Restart check-in',
+                          ),
                           onPressed: busy || remaining.isNegative
                               ? null
-                              : () => forcePresent(session),
-                          icon: const Icon(Icons.how_to_reg_outlined),
-                          label: const Text('Force present (fallback)'),
+                              : () => restartCheckIn(session),
                         ),
                       ),
                     ),

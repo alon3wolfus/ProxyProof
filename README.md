@@ -1,44 +1,32 @@
 # ProxyProof
 
-Flutter app for classroom attendance using rotating Bluetooth Low Energy (BLE) session tokens.
+ProxyProof records classroom attendance after a student's phone detects a nearby faculty Bluetooth Low Energy (BLE) broadcast. The session token rotates during class, and the server checks the token and reported signal strength before recording a check-in.
 
-## Build plan and status
+## Where the app stands
 
-1. **Role-based app and screens — implemented:** Faculty and Student login, live class list, student attendance history, faculty session dashboard, roster, manual attendance controls, and CSV export.
-2. **Authentication and SQLite service — implemented for demo use:** Node.js API with SQLite persistence and seeded demo accounts. All demo accounts use the password `demo`.
-3. **BLE attendance — implemented, device testing in progress:** Faculty broadcasts a random token that rotates every five seconds. Students scan and submit it; the server checks that it is fresh and the reported RSSI is at least -78 dBm. Faculty token rotations are serialized to avoid overlapping requests.
-4. **Fallback check-in — implemented locally; VPS deployment pending:** Students can use **Force present (fallback)** for an active class. It records `student_fallback`, which the faculty roster identifies separately. This bypasses proximity verification and should be used only when BLE check-in fails.
-5. **Phone validation and release — pending:** Verify BLE behavior on both Android phones, permissions, range, and fallback against the VPS API before making a release APK.
+The Flutter app has faculty and student accounts, live sessions, automatic BLE check-in, attendance history, faculty roster controls, and CSV export. The Node.js service stores demo users, sessions, token data, and attendance in SQLite. This is a working demo deployment; use demo records only.
 
-## Screen layout
+Students do not need to tap a check-in button. Once a faculty member starts a session, students can open the app and the phone scans for the session automatically. If scanning stalls, **Restart check-in** restarts Bluetooth discovery; it does not create an attendance mark. Attendance still requires the normal BLE token validation.
 
-- **Login:** Student/Faculty role selector, email and password fields, password visibility, and demo account shortcuts.
-- **Student home:** Live classes with room, faculty, and time remaining; automatic BLE scan/check-in status; confirmed attendance state; fallback check-in for each active class; attendance history and percentage; device notice.
-- **Faculty dashboard:** Start/close a live session, rotating BLE broadcast status, present roster, manual add/remove, device-change requests, and attendance export/history.
+## Try it on Android
 
-## Current implementation
+The app connects to the hosted API at `https://api.homelabforme.online` by default. Sign in on one phone as faculty and another as a student:
 
-The Flutter client uses the Node.js API in [`backend/server.mjs`](backend/server.mjs) and SQLite. SQLite persists users, sessions, rotating-token hashes, attendance marks, and device-change requests. The service seeds 2 faculty and 50 students from [`lib/demo_data.dart`](lib/demo_data.dart). Node.js 22.5 or newer is required for its built-in SQLite module.
+1. Sign in as faculty and start a session. Keep the app open and confirm the screen reports **Broadcasting**.
+2. Sign in as a student, open the live class, and keep the app open while it scans. A successful check-in appears in the faculty roster.
+3. If the student scan does not start or stalls, use **Restart check-in** on that class. Check the error/status shown in the app and confirm Bluetooth permissions are allowed.
 
-The student live-class list is fetched separately from Bluetooth check-in. Seeing a class only confirms the API can return the active session; an automatic present mark requires the BLE token to be received and accepted. If it fails, check the student screen's scan/error message and that the faculty screen reports **Broadcasting**. The fallback uses the authenticated student account and an active session, but does not verify physical presence.
+Keep Bluetooth on and both apps in the foreground while validating. Android 12 and newer require Nearby Devices permissions. Android 11 and earlier may also require Location permission and the phone's Location setting for BLE scanning. Background scanning and advertising are not implemented. The current advertising format supports Android; faculty advertising on iOS needs a different BLE protocol.
 
-RSSI comes from the student handset and is useful as a proximity filter, not proof against a modified app or a live relay. Device binding exists, but is disabled on the VPS (`DEVICE_BINDING_ENABLED=false`) for two-phone demo logins. Do not use the shared demo credentials or this setup for real student records.
+### Demo sign-ins
 
-### VPS test endpoint
+All demo accounts use the password `demo`. There are two faculty accounts and 50 student accounts. The full list is available below if you need an account other than the two quick-start examples.
 
-The API is at `https://api.homelabforme.online`. Its user-scoped files and deployment inventory are under `/home/vishu/apps/proxyproof-vps-deploy` on the VPS. The endpoint currently serves sign-in, live sessions, and the existing attendance API. **The new `POST /check-in/force` route is not deployed yet**; it returned `404 Route not found` when checked on 2026-10-17. The local machine could not SSH to the VPS because key/password authentication was denied, so the new [`backend/server.mjs`](backend/server.mjs) still needs to be copied to the VPS and the existing backend restarted. No Cloudflare settings were changed.
+- Faculty: `alex.morgan@proxyproof.demo`
+- Student: `aarav.mehta@proxyproof.demo`
 
-After deploying the backend route, build an APK that uses the VPS API:
-
-```sh
-flutter build apk --release --dart-define=PROXYPROOF_API=https://api.homelabforme.online
-```
-
-The deployment uses demo accounts and the shared demo password. Keep real attendance data off this test endpoint.
-
-## Demo accounts
-
-The seed data contains **2 faculty accounts and 50 student accounts**. All demo emails use the `@proxyproof.demo` domain. The API authenticates the selected role and email with the shared demo password `demo`. The account list is shown below.
+<details>
+<summary>Show all 52 demo accounts</summary>
 
 | Name | Role | Demo email |
 | --- | --- | --- |
@@ -95,33 +83,39 @@ The seed data contains **2 faculty accounts and 50 student accounts**. All demo 
 | Eshan Mallick | Student | eshan.mallick@proxyproof.demo |
 | Kavish Arora | Student | kavish.arora@proxyproof.demo |
 
-## Run locally on a USB-connected Android phone
+</details>
 
-1. In one terminal, start the API and SQLite service:
+## Get the Android APK
 
-   ```sh
-   node backend/server.mjs
-   ```
-
-2. In a second terminal, forward the phone's localhost port to the computer:
-
-   ```sh
-   adb reverse tcp:8787 tcp:8787
-   ```
-
-3. Start the Flutter app:
+The current universal APK is [`ProxyProof.apk`](ProxyProof.apk). It connects to the hosted API and can be sideloaded on Android devices compatible with the app's minimum Android version. To rebuild it from the project root:
 
 ```sh
 flutter pub get
-flutter run -d <device-id>
+flutter build apk --release
+cp build/app/outputs/flutter-apk/app-release.apk ProxyProof.apk
 ```
 
-The service seeds 52 accounts with password `demo`. Student and faculty phones need Bluetooth enabled and the app's Bluetooth permissions granted. For a second phone on Wi-Fi, start the service with `HOST=0.0.0.0` and run the app with `--dart-define=PROXYPROOF_API=http://<computer-lan-ip>:8787`.
+The project currently signs release builds with Flutter's debug signing key for direct installation and testing. That is suitable for this demo APK; configure a private release key before publishing through an app store. Keep the demo credentials and endpoint limited to test data.
 
-To build a debug APK for a local `adb reverse` test:
+## Bluetooth and attendance notes
+
+The faculty phone broadcasts a changing session token, and nearby student phones scan and submit it. The server accepts the check-in only when the session and token are current and the signal-strength check passes. RSSI is a proximity filter, not cryptographic proof of location; a modified client or live relay could defeat it. Device binding is disabled on the VPS to allow the two-phone demo flow. Do not use this setup for real student records.
+
+If a live class appears for a student but no mark appears on the faculty roster, first confirm the faculty phone says **Broadcasting**, then check the student's scan status and permissions. Restart check-in to restart discovery, and verify both devices remain online.
+
+## Optional: run the API on your development computer
+
+The normal phone workflow uses the hosted API, so this local setup is only needed when developing the backend. Node.js 22.5 or newer is required for its built-in SQLite module.
 
 ```sh
-flutter build apk --debug
+node backend/server.mjs
 ```
 
-The APK is written to `build/app/outputs/flutter-apk/app-debug.apk`. The VPS-targeted debug build uses the same path; build it with `--dart-define=PROXYPROOF_API=https://api.homelabforme.online`. Do not distribute the local demo service or demo credentials as production software. Production hosting, stronger authentication, security review, and device/range testing remain future work.
+For a phone on the same Wi-Fi network as the development computer, start the service so it accepts LAN connections and point Flutter at the computer's LAN address:
+
+```sh
+HOST=0.0.0.0 node backend/server.mjs
+flutter run -d <device-id> --dart-define=PROXYPROOF_API=http://<computer-lan-ip>:8787
+```
+
+The server seeds the demo accounts on first use. Keep the local service and shared demo password on a trusted network.
