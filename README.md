@@ -32,7 +32,7 @@ sequenceDiagram
     loop Every 5 seconds
         Faculty->>API: Register fresh token
         API-->>Faculty: Token accepted; valid for 12 seconds
-        Faculty--)Student: BLE service data: sessionId:token
+        Faculty->>Student: BLE service data: sessionId:token
     end
     Student->>API: HTTPS check-in: sessionId, token, RSSI, deviceId
     API->>API: Validate student, session, signal, token expiry
