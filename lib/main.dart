@@ -6,6 +6,7 @@ import 'dart:typed_data';
 
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'package:flutter/material.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
 
 import 'api.dart';
@@ -272,7 +273,7 @@ class _LoginPageState extends State<LoginPage> {
                 ),
                 const SizedBox(height: 4),
                 const Text(
-                  'Local service · SQLite records · rotating Bluetooth check-in',
+                  'Hosted service · rotating Bluetooth check-in',
                   textAlign: TextAlign.center,
                   style: TextStyle(color: Color(0xFF8A94A7), fontSize: 11),
                 ),
@@ -386,6 +387,9 @@ class _FacultyPageState extends State<FacultyPage> {
       return broadcasting;
     }
     rotatingToken = true;
+    // BLE handshake: register this fresh token with the API before publishing
+    // it. The server accepts it for 12 seconds; the faculty repeats this every
+    // 5 seconds so a student can validate a recently observed broadcast.
     final bytes = List<int>.generate(11, (_) => Random.secure().nextInt(256));
     final token = base64Url.encode(bytes).replaceAll('=', '');
     try {
@@ -716,6 +720,7 @@ class _StudentPageState extends State<StudentPage> {
   final central = CentralManager();
   StreamSubscription? sub;
   Timer? liveClassRefresh;
+  Timer? scanStatusTimer;
   bool scanning = false, busy = false, checked = false;
   bool loadingLiveClasses = false;
   final checkedSessionIds = <String>{};
@@ -729,13 +734,48 @@ class _StudentPageState extends State<StudentPage> {
   int completedSessions = 0;
   int attendedSessions = 0;
   final seen = <String>{};
+  int scanEventCount = 0;
+  bool proxySignalSeen = false;
+
+  Future<bool> _requestProximityLocationPermission() async {
+    if (await Permission.locationWhenInUse.isGranted) return true;
+    if (!mounted) return false;
+    final continueToPrompt = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Allow Location while using ProxyProof?'),
+        content: const Text(
+          'ProxyProof uses Bluetooth signal strength to estimate whether your phone is near the classroom. It does not read or store GPS coordinates.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Not now'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Continue'),
+          ),
+        ],
+      ),
+    );
+    if (continueToPrompt != true) return false;
+    final permission = await Permission.locationWhenInUse.request();
+    return permission.isGranted;
+  }
+
   Future<void> scan() async {
     try {
       if (Platform.isAndroid) {
         final authorized = await central.authorize();
         if (!authorized) {
           throw Exception(
-            'Bluetooth scan permission was denied. Allow Nearby devices and retry.',
+            'Bluetooth permission was denied. Allow Nearby devices and Location while using ProxyProof, then retry.',
+          );
+        }
+        if (!await _requestProximityLocationPermission()) {
+          throw Exception(
+            'Allow Location while using ProxyProof. It is used with Bluetooth signal strength to check classroom proximity.',
           );
         }
         if (central.state == BluetoothLowEnergyState.poweredOff) {
@@ -746,6 +786,9 @@ class _StudentPageState extends State<StudentPage> {
         }
       }
       await sub?.cancel();
+      scanStatusTimer?.cancel();
+      scanEventCount = 0;
+      proxySignalSeen = false;
       sub = central.discovered.listen(_found);
       await central.startDiscovery();
       if (mounted) {
@@ -754,6 +797,16 @@ class _StudentPageState extends State<StudentPage> {
           message = 'Scanning for an active class…';
         });
       }
+      scanStatusTimer = Timer.periodic(const Duration(seconds: 8), (_) {
+        if (!mounted || !scanning || busy || checked) return;
+        setState(() {
+          if (scanEventCount == 0) {
+            message = 'Bluetooth scan is running, but no nearby BLE devices are visible. Check Bluetooth and Location settings.';
+          } else if (!proxySignalSeen) {
+            message = 'Nearby BLE devices are visible, but no ProxyProof signal yet. Confirm faculty says Broadcasting and move closer.';
+          }
+        });
+      });
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -765,18 +818,37 @@ class _StudentPageState extends State<StudentPage> {
   }
 
   Future<void> _found(DiscoveredEventArgs e) async {
+    scanEventCount++;
     if (busy || checked) return;
     final raw = e.advertisement.serviceData[beaconId];
     if (raw == null) return;
+    proxySignalSeen = true;
     final payload = utf8.decode(raw, allowMalformed: true).split(':');
-    if (payload.length != 2 || payload[0].length != 8 || !seen.add(payload[0]))
+    if (payload.length != 2 || payload[0].length != 8) {
+      if (mounted)
+        setState(
+          () => message = 'A ProxyProof Bluetooth signal was detected, but its data was invalid. Restart check-in and ask faculty to restart the broadcast.',
+        );
       return;
+    }
+    if (!seen.add(payload[0])) return;
     if (scanningSessionId != null && payload[0] != scanningSessionId) {
       seen.remove(payload[0]);
+      if (mounted)
+        setState(
+          () => message = 'A different class signal was detected. Use Restart check-in on the class you are attending.',
+        );
       return;
     }
     busy = true;
+    if (mounted)
+      setState(
+        () => message =
+            'Class signal detected (${e.rssi} dBm). Confirming attendance…',
+      );
     try {
+      // Student handshake: submit the session and token decoded from the BLE
+      // service data. The server, not this client, decides whether to mark present.
       await Api.instance.request(
         'POST',
         '/check-in',
@@ -789,6 +861,7 @@ class _StudentPageState extends State<StudentPage> {
       );
       await central.stopDiscovery();
       await sub?.cancel();
+      scanStatusTimer?.cancel();
       final matchedClass = liveClasses.where(
         (session) => session['id'] == payload[0],
       );
@@ -820,6 +893,8 @@ class _StudentPageState extends State<StudentPage> {
       await central.stopDiscovery();
       await sub?.cancel();
       seen.clear();
+      scanEventCount = 0;
+      proxySignalSeen = false;
       scanningSessionId = sessionId;
       setState(() {
         checked = false;
@@ -888,6 +963,7 @@ class _StudentPageState extends State<StudentPage> {
 
   @override
   void dispose() {
+    scanStatusTimer?.cancel();
     central.stopDiscovery();
     sub?.cancel();
     liveClassRefresh?.cancel();

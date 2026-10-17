@@ -16,7 +16,86 @@ The app connects to the hosted API at `https://api.homelabforme.online` by defau
 2. Sign in as a student, open the live class, and keep the app open while it scans. A successful check-in appears in the faculty roster.
 3. If the student scan does not start or stalls, use **Restart check-in** on that class. Check the error/status shown in the app and confirm Bluetooth permissions are allowed.
 
-Keep Bluetooth on and both apps in the foreground while validating. Android 12 and newer require Nearby Devices permissions. Android 11 and earlier may also require Location permission and the phone's Location setting for BLE scanning. Background scanning and advertising are not implemented. The current advertising format supports Android; faculty advertising on iOS needs a different BLE protocol.
+Keep Bluetooth on and both apps in the foreground while validating. Android asks for Nearby Devices permission for BLE, and the student app also requests foreground Location because it uses signal strength to estimate classroom proximity. ProxyProof does not read or store GPS coordinates. On Android 11 and earlier, Location services must also be switched on for BLE scanning. Background scanning and advertising are not implemented. The current advertising format supports Android; faculty advertising on iOS needs a different BLE protocol.
+
+## BLE token rotation and check-in handshake
+
+This is a one-way BLE broadcast followed by an authenticated HTTPS check-in. Phones do not pair or connect to each other over Bluetooth. The faculty phone broadcasts the session ID and current token; the student phone submits that data to the API, which makes the attendance decision.
+
+```mermaid
+sequenceDiagram
+    participant Faculty
+    participant API
+    participant Student
+    Faculty->>API: Create live session
+    API-->>Faculty: Session ID
+    loop Every 5 seconds
+        Faculty->>API: Register fresh token
+        API-->>Faculty: Token accepted; valid for 12 seconds
+        Faculty--)Student: BLE service data: sessionId:token
+    end
+    Student->>API: HTTPS check-in: sessionId, token, RSSI, deviceId
+    API->>API: Validate student, session, signal, token expiry
+    API-->>Student: Attendance accepted or rejection reason
+    loop Every 2 seconds
+        Faculty->>API: Refresh attendance roster
+        API-->>Faculty: Updated present list
+    end
+```
+
+### Faculty: create and rotate the code
+
+The faculty client creates 11 cryptographically random bytes, encodes them as unpadded Base64URL, registers the token with the API, then advertises `sessionId:token` in the `FDF0` BLE service-data field. The first token is sent as soon as broadcasting starts; it is replaced every five seconds.
+
+The core implementation is in [`_rotateToken()`](lib/main.dart#L385):
+
+```dart
+final bytes = List<int>.generate(11, (_) => Random.secure().nextInt(256));
+final token = base64Url.encode(bytes).replaceAll('=', '');
+
+await Api.instance.request(
+  'POST',
+  '/sessions/$sessionId/token',
+  data: {'token': token},
+);
+
+await peripheral.startAdvertising(
+  Advertisement(
+    serviceData: {
+      beaconId: Uint8List.fromList(utf8.encode('$sessionId:$token')),
+    },
+  ),
+);
+```
+
+The API stores only the token's SHA-256 hash and gives it a 12-second expiry. The Flutter timer schedules the next rotation after five seconds, leaving a short overlap so students can validate a recently received packet. See the [server token route](backend/server.mjs#L73).
+
+### Student: scan and submit the handshake
+
+The student reads the matching BLE service-data value and sends it to `POST /check-in` using the signed-in account's HTTPS session. The client code is in [`_found()`](lib/main.dart#L820):
+
+```dart
+final raw = e.advertisement.serviceData[beaconId];
+if (raw == null) return;
+final payload = utf8.decode(raw, allowMalformed: true).split(':');
+
+await Api.instance.request(
+  'POST',
+  '/check-in',
+  data: {
+    'sessionId': payload[0],
+    'token': payload[1],
+    'rssi': e.rssi,
+    'deviceId': await Api.instance.deviceId,
+  },
+);
+```
+
+### Server: decide whether to mark present
+
+The [check-in route](backend/server.mjs#L96) requires an authenticated student and an active session. It rejects invalid or weaker-than-`-78 dBm` RSSI, checks that the submitted token hash belongs to that session and has not expired, then inserts a `ble` attendance record. Device binding is an additional check only when enabled; it is currently disabled on the demo VPS. The faculty roster refreshes from the API every two seconds.
+
+The token is a short-lived rotating value, not a Bluetooth pairing secret. BLE payloads can be observed over the air, and RSSI is an approximate proximity signal; this handshake makes casual code sharing harder but does not prevent a live relay or a modified client.
 
 ### Demo sign-ins
 

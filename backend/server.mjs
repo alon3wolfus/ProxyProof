@@ -72,6 +72,7 @@ const server = createServer(async (req,res) => {
       if(user.role==='teacher'&&session.faculty_id!==user.id){json(res,403,{error:'This session belongs to another faculty account.'});return;}
       if(action==='token'&&req.method==='POST'){
         if(user.role!=='teacher'||session.closed||session.ends_at<=Date.now()){json(res,409,{error:'Session is no longer active.'});return;}
+        // Keep only a hash server-side and give each advertised token a 12s lifetime.
         const b=await body(req); const token=String(b.token||''); if(token.length<14){json(res,400,{error:'Rotating token is invalid.'});return;}
         db.prepare('DELETE FROM tokens WHERE expires_at<=?').run(Date.now()); db.prepare('INSERT OR REPLACE INTO tokens VALUES(?,?,?)').run(hash(token),id,Date.now()+12000);
         json(res,200,{accepted:true,expiresAt:Date.now()+12000});return;
@@ -93,6 +94,8 @@ const server = createServer(async (req,res) => {
       }
     }
     if(req.method==='POST'&&url.pathname==='/check-in'){
+      // Complete the BLE/HTTPS handshake only after every session, proximity,
+      // optional device-binding, and short-lived-token check succeeds.
       const user=requireAuth(req,res,'student'); if(!user)return; const b=await body(req); const id=String(b.sessionId||''); const session=db.prepare('SELECT * FROM sessions WHERE id=?').get(id);
       if(!session||session.closed||session.ends_at<=Date.now()){json(res,409,{error:'This attendance session has ended.'});return;}
       if(deviceBindingEnabled && user.device_id!==String(b.deviceId||'')){json(res,403,{error:'This phone is not registered to this account.'});return;}
